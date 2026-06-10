@@ -1,0 +1,7 @@
+demo.init.zhaw.ch {
+    reverse_proxy demoobject-frontend:80
+}
+
+llm-backend.cloudlab.zhaw.ch {
+    reverse_proxy llm-backend-api:8000
+}
