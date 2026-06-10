@@ -1,0 +1,137 @@
+name: Demo Edge - Deploy Caddy
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: demo-edge-deploy
+  cancel-in-progress: true
+
+jobs:
+  deploy_edge:
+    name: Deploy Shared Edge to VM
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      VM_HOST: ${{ vars.VM_HOST }}
+      VM_USER: ${{ vars.VM_USER || 'ubuntu' }}
+      DEPLOY_PATH: ${{ vars.DEPLOY_PATH || './demo_edge' }}
+      SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Validate required configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          required_vars=(
+            VM_HOST
+            VM_USER
+            DEPLOY_PATH
+          )
+
+          required_secrets=(
+            SSH_PRIVATE_KEY
+          )
+
+          for key in "${required_vars[@]}"; do
+            if [ -z "${!key:-}" ]; then
+              echo "Missing required GitHub Variable: ${key}" >&2
+              exit 1
+            fi
+          done
+
+          for key in "${required_secrets[@]}"; do
+            if [ -z "${!key:-}" ]; then
+              echo "Missing required GitHub Secret: ${key}" >&2
+              exit 1
+            fi
+          done
+
+      - name: Configure SSH access to VM
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "${HOME}/.ssh"
+          chmod 700 "${HOME}/.ssh"
+          printf '%s\n' "${SSH_PRIVATE_KEY}" > "${HOME}/.ssh/demo_edge_deploy_key"
+          chmod 600 "${HOME}/.ssh/demo_edge_deploy_key"
+          ssh-keyscan -H "${VM_HOST}" >> "${HOME}/.ssh/known_hosts"
+          chmod 644 "${HOME}/.ssh/known_hosts"
+
+      - name: Validate Docker availability on VM
+        shell: bash
+        run: |
+          set -euo pipefail
+          ssh -i "${HOME}/.ssh/demo_edge_deploy_key" -o StrictHostKeyChecking=yes "${VM_USER}@${VM_HOST}" '
+            set -euo pipefail
+            docker version
+            docker compose version
+          '
+
+      - name: Prepare edge files on VM
+        shell: bash
+        run: |
+          set -euo pipefail
+          ssh -i "${HOME}/.ssh/demo_edge_deploy_key" -o StrictHostKeyChecking=yes "${VM_USER}@${VM_HOST}" "set -euo pipefail; mkdir -p $(printf '%q' "${DEPLOY_PATH}")"
+          ssh -i "${HOME}/.ssh/demo_edge_deploy_key" -o StrictHostKeyChecking=yes "${VM_USER}@${VM_HOST}" "set -euo pipefail; cat > $(printf '%q' "${DEPLOY_PATH}/docker-compose.yaml")" < docker-compose.yaml
+          ssh -i "${HOME}/.ssh/demo_edge_deploy_key" -o StrictHostKeyChecking=yes "${VM_USER}@${VM_HOST}" "set -euo pipefail; cat > $(printf '%q' "${DEPLOY_PATH}/Caddyfile")" < Caddyfile
+
+      - name: Deploy shared Caddy edge on VM
+        shell: bash
+        run: |
+          set -euo pipefail
+          ssh -i "${HOME}/.ssh/demo_edge_deploy_key" -o StrictHostKeyChecking=yes "${VM_USER}@${VM_HOST}" 'bash -s' <<EOF
+          set -euo pipefail
+          DEPLOY_PATH=$(printf '%q' "${DEPLOY_PATH}")
+
+          docker network inspect edge >/dev/null 2>&1 || docker network create edge
+          docker compose -f "\${DEPLOY_PATH}/docker-compose.yaml" pull caddy
+          docker compose -f "\${DEPLOY_PATH}/docker-compose.yaml" up -d --remove-orphans caddy
+
+          for i in \$(seq 1 30); do
+            status=\$(docker inspect --format='{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' demo-edge-caddy 2>/dev/null || true)
+            if [ "\${status}" = "healthy" ] || [ "\${status}" = "running" ]; then
+              exit 0
+            fi
+            sleep 2
+          done
+
+          echo "Shared edge Caddy container did not become ready in time." >&2
+          docker ps >&2
+          docker logs --tail 100 demo-edge-caddy >&2 || true
+          exit 1
+          EOF
+
+      - name: Validate Caddy is serving HTTPS redirects
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          demo_headers=$(curl -I --connect-timeout 10 --retry 10 --retry-delay 3 http://demo.init.zhaw.ch 2>&1 || true)
+          echo "$demo_headers"
+          if ! printf '%s\n' "$demo_headers" | grep -Eq 'HTTP/[0-9.]+ 30[128]'; then
+            echo "DemoObject HTTP endpoint did not return a redirect." >&2
+            exit 1
+          fi
+          if ! printf '%s\n' "$demo_headers" | grep -qi '^location: https://demo\.init\.zhaw\.ch'; then
+            echo "DemoObject HTTP endpoint did not redirect to HTTPS." >&2
+            exit 1
+          fi
+
+          llm_headers=$(curl -I --connect-timeout 10 --retry 10 --retry-delay 3 http://llm-backend.cloudlab.zhaw.ch/healthz 2>&1 || true)
+          echo "$llm_headers"
+          if ! printf '%s\n' "$llm_headers" | grep -Eq 'HTTP/[0-9.]+ 30[128]'; then
+            echo "LLM backend HTTP endpoint did not return a redirect." >&2
+            exit 1
+          fi
+          if ! printf '%s\n' "$llm_headers" | grep -qi '^location: https://llm-backend\.cloudlab\.zhaw\.ch'; then
+            echo "LLM backend HTTP endpoint did not redirect to HTTPS." >&2
+            exit 1
+          fi
